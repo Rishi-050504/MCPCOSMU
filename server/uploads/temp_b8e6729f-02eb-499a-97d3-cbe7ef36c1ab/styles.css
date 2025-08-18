@@ -1,0 +1,17 @@
+/* Intentional CSS issues */
+body {
+  font-family: Inter, system-ui, -apple-system, sans-serif; /* misspelled 'font-family' */
+  background: #fafafa;
+/* missing closing brace for body will break following rules */
+}
+
+.button {
+  padding: 12px 16px;
+  background-color: #007bff; /* misspelled 'background-color' */
+  color: white;
+  border-radius: 9999px;
+}
+
+.button {
+  padding: 0px; /* invalid value */
+}

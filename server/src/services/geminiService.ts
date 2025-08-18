@@ -1,28 +1,13 @@
-import { GoogleGenerativeAI, Part, Tool } from '@google/generative-ai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import pdf from 'pdf-parse';
 import fs from 'fs';
-import path from 'path';
-import { FilesystemMcp } from '../mcp/filesystem.service';
-import { FetchMcp } from '../mcp/fetch.service';
-import { MemoryMcp } from '../mcp/memory.service';
-import { SequentialThinkingMcp } from '../mcp/sequentialThinking.service'; // <-- Import the final MCP
+import { parseJsonFromText } from '../utils/jsonUtils';
 
-// --- Initialize the AI Client and All Tools ---
+// --- Initialize the AI Client ---
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) throw new Error("GEMINI_API_KEY is missing.");
 
 const genAI = new GoogleGenerativeAI(apiKey);
-
-// Add all MCP tools to the agent's toolbox
-const agentTools: Tool[] = [{
-  functionDeclarations: [
-    ...FilesystemMcp.getToolSpec(),
-    FetchMcp.getToolSpec(),
-    MemoryMcp.getToolSpec(),
-    SequentialThinkingMcp.getToolSpec() // <-- Add the new tool
-  ]
-}];
-
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 // --- Checklist Generation (Unchanged) ---
@@ -54,15 +39,11 @@ export const generateChecklistFromSrs = async (files: Express.Multer.File[]): Pr
   `;
 
   try {
-    const generationModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const result = await generationModel.generateContent(prompt);
+    const result = await model.generateContent(prompt);
     const rawText = result.response.text();
-    const jsonStartIndex = rawText.indexOf('{');
-    const jsonEndIndex = rawText.lastIndexOf('}') + 1;
-    const jsonString = rawText.substring(jsonStartIndex, jsonEndIndex);
-    const parsedResult = JSON.parse(jsonString);
+    const parsedResult = parseJsonFromText(rawText);
 
-    if (!parsedResult.checklist || !Array.isArray(parsedResult.checklist)) {
+    if (!parsedResult || !parsedResult.checklist || !Array.isArray(parsedResult.checklist)) {
       throw new Error("The AI response did not contain a valid 'checklist' array.");
     }
     return parsedResult.checklist;
@@ -72,122 +53,84 @@ export const generateChecklistFromSrs = async (files: Express.Multer.File[]): Pr
   }
 };
 
-// --- Main Agent-Based Analysis Function (Updated) ---
-export const analyzeProjectWithAgent = async (filesystemMcp: FilesystemMcp, checklist: any[]) => {
+// --- Main Analysis Function (Updated with more forceful prompts) ---
+export const analyzeProject = async (
+  fileContents: Record<string, string>,
+  checklist: any[]
+) => {
   const fileIssues: Record<string, any> = {};
-  const fetchMcp = new FetchMcp();
-  const memoryMcp = new MemoryMcp(filesystemMcp);
 
-  await memoryMcp.buildMemory();
+  let fullCodeContext = '';
+  for (const filePath in fileContents) {
+    fullCodeContext += `\n--- File: ${filePath} ---\n${fileContents[filePath]}\n`;
+  }
 
-  for (const item of checklist) {
-    if (!item || !item.text) continue;
-    const requirementText = item.text;
-    console.log(`[Agent] Analyzing requirement: "${requirementText}"`);
+  console.log('[Agent] Starting comprehensive code audit...');
+  const combinedRequirements = checklist.map(item => `- ${item.text}`).join('\n');
 
-    const chat = model.startChat({ tools: agentTools });
+  const analysisPrompt = `
+    You are a world-class code auditor. Your primary goal is to find bugs and compliance issues. Be extremely critical.
 
-    // Updated prompt to encourage planning for complex tasks
-    const prompt = `
-      Your goal is to determine if the codebase complies with the requirement: "${requirementText}".
-      You have access to a toolbox: 'listFiles', 'readFile', 'fetchContent', 'queryCodebaseMemory', and 'createPlan'.
+    **ANALYSIS TASKS (Perform BOTH):**
 
-      If the requirement is simple, use the tools directly.
-      If the requirement is complex (involves multiple files, steps, or concepts), you MUST use the 'createPlan' tool first to outline your steps. I will then execute your plan for you.
-      
-      After completing your plan (or direct tool use), provide your final analysis in the required JSON format.
-      JSON output format:
-      {
-        "isCompliant": <boolean>,
-        "filePath": "<string>",
-        "issue": "<string>",
-        "originalCode": "<string>",
-        "suggestedCode": "<string>"
-      }
-    `;
+    **Task 1: SRS Compliance Audit**
+    Verify the entire codebase against the following requirements:
+    ${combinedRequirements}
 
-    let result = await chat.sendMessage(prompt);
+    **Task 2: General Code Quality Audit**
+    Independently scrutinize the entire codebase for common errors: null pointer exceptions, security vulnerabilities (like hardcoded secrets), inefficient code, and lack of error handling.
 
-    for (let i = 0; i < 10; i++) { // Max 10 steps in a plan
-      const call = result.response.functionCalls()?.[0];
-      if (!call) break;
+    **OUTPUT INSTRUCTIONS:**
+    Your final answer MUST be a single JSON object with a key "issues", containing an array of all problems you found. For each issue, you must provide the complete file content for both the original and suggested code.
 
-      console.log(`[Agent] AI wants to call tool: ${call.name}`, call.args);
-      let toolResult: Part | undefined;
-      const args = call.args as { path?: string; url?: string; filePath?: string; plan?: string[] };
-
-      try {
-        if (call.name === 'createPlan') {
-          // The AI has created a plan. We will now execute it.
-          const plan = args.plan || [];
-          console.log(`[Agent] AI created a plan with ${plan.length} steps. Executing...`);
-          let planContext = "Executing plan. Here are the results of each step:\n";
-
-          for (const step of plan) {
-            // Ask the model how to execute a single step of its own plan
-            const stepResult = await chat.sendMessage(`Now execute this step: "${step}"`);
-            const stepCall = stepResult.response.functionCalls()?.[0];
-            if (stepCall) {
-              // Execute the tool for the current step and gather the result
-              // (This is a simplified execution loop; a real implementation would be recursive)
-              const stepArgs = stepCall.args as { path?: string; url?: string; filePath?: string; };
-              if (stepCall.name === 'readFile') {
-                  const content = await filesystemMcp.readFile(stepArgs.path || '');
-                  planContext += `- Read file ${stepArgs.path}: ${content.substring(0, 200)}...\n`;
-              } // ... handle other tools similarly
-            }
-          }
-          toolResult = { functionResponse: { name: 'createPlan', response: { summary: planContext } } };
-
-        } else if (call.name === 'listFiles') {
-          const files = await filesystemMcp.listFiles(args.path || '.');
-          toolResult = { functionResponse: { name: 'listFiles', response: { files } } };
-        } else if (call.name === 'readFile') {
-          const content = await filesystemMcp.readFile(args.path || '');
-          toolResult = { functionResponse: { name: 'readFile', response: { content } } };
-        } else if (call.name === 'fetchContent') {
-          const content = await fetchMcp.fetchAndParseContent(args.url || '');
-          toolResult = { functionResponse: { name: 'fetchContent', response: { content } } };
-        } else if (call.name === 'queryCodebaseMemory') {
-          const summary = await memoryMcp.queryMemory(args.filePath || '');
-          toolResult = { functionResponse: { name: 'queryCodebaseMemory', response: { summary } } };
+    **JSON OUTPUT FORMAT (VERY IMPORTANT):**
+    {
+      "issues": [
+        {
+          "filePath": "<string, the full path to the problematic file>",
+          "issue": "<string, a concise description of the bug or compliance violation>",
+          "originalCode": "<string, the ENTIRE, UNCHANGED content of the problematic file>",
+          "suggestedCode": "<string, the ENTIRE content of the file with the fix APPLIED. Do not add comments like '// fix for issue'. Just provide the complete, corrected code.>"
         }
-      } catch (error: any) {
-        toolResult = { functionResponse: { name: call.name, response: { error: error.message } } };
-      }
-
-      if (toolResult) {
-        result = await chat.sendMessage([toolResult]);
-      } else {
-        break;
-      }
+      ]
     }
+  `;
 
+  try {
+    const result = await model.generateContent([analysisPrompt, fullCodeContext]);
     const rawText = result.response.text();
-    const jsonMatch = rawText.match(/{[\s\S]*}/);
-    if (jsonMatch) {
-      const analysisJson = JSON.parse(jsonMatch[0]);
-      if (analysisJson && !analysisJson.isCompliant) {
-        const filePath = analysisJson.filePath;
-        if (filePath) {
-          fileIssues[filePath] = {
-            issue: analysisJson.issue,
-            language: path.extname(filePath).substring(1),
-            original: analysisJson.originalCode,
-            suggestion: analysisJson.suggestedCode,
+    const analysisJson = parseJsonFromText(rawText);
+    
+    if (analysisJson && analysisJson.issues && Array.isArray(analysisJson.issues)) {
+      for (const issue of analysisJson.issues) {
+        if (issue.filePath && fileContents[issue.filePath]) {
+          // Because the AI now provides the full original code, we don't need to add it ourselves.
+          // We only care about the issue description and the full suggested code.
+          fileIssues[issue.filePath] = {
+            issue: issue.issue,
+            suggestion: issue.suggestedCode,
           };
         }
       }
     }
+  } catch(error) {
+      console.error(`Error during comprehensive analysis:`, error);
   }
 
-  const fileContents = await filesystemMcp.getAllFileContents();
-  return { checklist, fileIssues, fileContents };
+  const updatedChecklist = checklist.map(item => {
+      const isCompliant = !Object.values(fileIssues).some((issue: any) => 
+          item.text.split(' ').some((keyword: string) => keyword.length > 3 && issue.issue.includes(keyword))
+      );
+      return { ...item, compliant: isCompliant };
+  });
+
+  return { checklist: updatedChecklist, fileIssues, fileContents };
 };
+
 
 // --- Chatbot Conversation Handler (Unchanged) ---
 export const getChatResponse = async (userMessage: string, history: any[]) => {
-  const chatModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  const chatModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
   const chat = chatModel.startChat({
     history: history,
     generationConfig: { maxOutputTokens: 200 },
